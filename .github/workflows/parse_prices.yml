@@ -1,16 +1,14 @@
 name: Parse Ozon & Yandex Market Prices
 
 on:
-  # Ручной запуск из вкладки Actions в любой момент
   workflow_dispatch:
-  # Автозапуск каждый день в 09:00 и 18:00 по Москве (06:00 и 15:00 UTC)
   schedule:
     - cron: '0 6,15 * * *'
 
 jobs:
   parse:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -22,12 +20,10 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install chromium
-          playwright install-deps chromium
+        run: pip install -r requirements.txt
 
       - name: Run price parser
         env:
           GAS_WEBAPP_URL: ${{ secrets.GAS_WEBAPP_URL }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python parser.py
