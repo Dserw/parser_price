@@ -3,13 +3,12 @@ import re
 import json
 import time
 import random
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 from curl_cffi import requests as cffi_requests
 import requests
 
 GAS_URL = os.environ["GAS_WEBAPP_URL"]
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
-
 PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
 
@@ -23,35 +22,35 @@ def clean_price(val):
 
 
 def create_session():
-    session = cffi_requests.Session(impersonate="chrome131")
+    # "chrome" автоматически использует последний доступный TLS-отпечаток в библиотеке
+    session = cffi_requests.Session(impersonate="chrome")
     if PROXIES:
         session.proxies = PROXIES
     session.headers.update({
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
     return session
 
 
 def parse_ozon(session, url: str, debug=False):
     """
-    Парсит Ozon через внутренний JSON-эндпоинт витрины (webPrice).
+    Парсит Ozon через внутренний JSON API мобильной витрины (mweb_client).
     Возвращает (цена_без_карты, цена_с_Ozon_картой).
     """
     if not url or "ozon.ru" not in url:
         return None, None
 
     try:
-        parsed = urlparse(url)
-        path = parsed.path
+        path = urlparse(url).path
         api_url = f"https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url={path}"
 
         resp = session.get(
             api_url,
             headers={
                 "Accept": "application/json",
-                "x-o3-app-name": "dweb_client",
-                "x-o3-app-version": "release_1-1-2025",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+                "x-o3-app-name": "mweb_client",
+                "x-o3-app-version": "release_20-11-2025",
                 "Referer": url,
             },
             timeout=20,
@@ -66,29 +65,26 @@ def parse_ozon(session, url: str, debug=False):
         data = resp.json()
         widget_states = data.get("widgetStates", {})
 
+        no_card = None
+        with_card = None
+
         for key, raw_json in widget_states.items():
+            # 1. Виджет webPrice (основной блок цен)
             if key.startswith("webPrice"):
-                price_data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
-                # cardPrice — цена по Ozon Карте, price — обычная цена без карты
-                with_card = clean_price(price_data.get("cardPrice"))
-                no_card = clean_price(price_data.get("price"))
+                w = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+                with_card = clean_price(w.get("cardPrice")) or with_card
+                no_card = clean_price(w.get("price")) or no_card
 
-                if no_card or with_card:
-                    if not no_card:
-                        no_card = with_card
-                    if not with_card:
-                        with_card = no_card
-                    return no_card, with_card
+            # 2. Виджет webSale (резервный блок с cellTrackingInfo)
+            elif key.startswith("webSale") and not no_card:
+                w = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+                prod = w.get("cellTrackingInfo", {}).get("product", {})
+                if prod:
+                    no_card = clean_price(prod.get("price")) or no_card
+                    with_card = clean_price(prod.get("finalPrice")) or with_card
 
-        # Резервный поиск цен в полном JSON ответа
-        text = resp.text
-        card_m = re.search(r'"cardPrice"\s*:\s*"([^"]+)"', text)
-        price_m = re.search(r'"price"\s*:\s*"([\d\s\u00a0]+₽)"', text)
-        if card_m or price_m:
-            with_card = clean_price(card_m.group(1)) if card_m else None
-            no_card = clean_price(price_m.group(1)) if price_m else with_card
-            if no_card:
-                return no_card, (with_card or no_card)
+        if no_card or with_card:
+            return (no_card or with_card), (with_card or no_card)
 
         return None, None
     except Exception as e:
@@ -106,18 +102,24 @@ def parse_ym(session, url: str, debug=False):
         return None, None
 
     try:
-        resp = session.get(url, timeout=20)
+        resp = session.get(
+            url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            },
+            timeout=20,
+        )
         html = resp.text
 
         if debug:
-            is_captcha = "SmartCaptcha" in html or "showcaptcha" in resp.url
+            is_captcha = "SmartCaptcha" in html or "showcaptcha" in str(resp.url)
             print(f"  [DEBUG YM] HTTP {resp.status_code} | captcha={is_captcha} | len={len(html)}")
 
-        if resp.status_code != 200 or "showcaptcha" in resp.url:
+        if resp.status_code != 200 or "showcaptcha" in str(resp.url):
             return None, None
 
-        # Ищем цены в встроенном JSON-состоянии страницы Маркета
-        # 1. Цена с Яндекс Пэй (yaPayPrice / greenPrice / fintechPrice)
+        # 1. Цена с Яндекс Пэй
         pay_patterns = [
             r'"yaPayPrice"\s*:\s*\{\s*"value"\s*:\s*(\d+)',
             r'"greenPrice"\s*:\s*\{\s*"value"\s*:\s*(\d+)',
@@ -133,7 +135,7 @@ def parse_ym(session, url: str, debug=False):
                     with_pay = val
                     break
 
-        # 2. Основная цена без Пэй ("price":{"value":1234,"currency":"RUR"})
+        # 2. Обычная цена без Пэй
         price_matches = re.findall(r'"price"\s*:\s*\{\s*"value"\s*:\s*(\d+)\s*,\s*"currency"\s*:\s*"RUR"', html)
         prices = [int(p) for p in price_matches if int(p) > 10]
 
@@ -159,9 +161,13 @@ def send_updates(updates):
     if not updates:
         return
     try:
-        # Google Apps Script при POST делает 302 редирект, requests сохраняет тело при правильной обработке
-        r = requests.post(GAS_URL, json=updates, timeout=30)
-        print(f"  -> Записано в таблицу: {len(updates)} строк (статус {r.status_code})")
+        r = requests.post(
+            GAS_URL,
+            data=json.dumps(updates),
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        print(f"  -> Записано в таблицу: {len(updates)} строк (HTTP {r.status_code} | ответ: {r.text[:120]})")
     except Exception as e:
         print(f"  -> Ошибка отправки в Google Таблицу: {e}")
 
@@ -178,7 +184,6 @@ def main():
     print(f"Получено строк из таблицы: {len(tasks)}")
     session = create_session()
 
-    # Прогреваем куки Ozon заходом на главную
     try:
         session.get("https://www.ozon.ru/", timeout=15)
     except Exception:
@@ -197,7 +202,7 @@ def main():
         if not ozon_url and not ym_url:
             continue
 
-        debug = idx <= 5  # Подробный лог для первых 5 товаров
+        debug = idx <= 5
         if debug:
             print(f"[{idx}/{len(tasks)}] Проверка {sku}...")
 
@@ -228,7 +233,7 @@ def main():
             send_updates(updates)
             updates = []
 
-        time.sleep(random.uniform(0.6, 1.4))
+        time.sleep(random.uniform(0.5, 1.2))
 
     send_updates(updates)
     print(f"Готово! Спарсено Ozon: {success_ozon}, Яндекс Маркет: {success_ym}")
