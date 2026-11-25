@@ -96,6 +96,10 @@ def main():
     resp = requests.get(GAS_URL, timeout=30)
     resp.raise_for_status()
     tasks = resp.json()
+
+    if not isinstance(tasks, list):
+        raise RuntimeError(f"Google Apps Script вернул ошибку вместо списка товаров: {tasks}")
+
     print(f"Получено строк: {len(tasks)}")
 
     updates = []
